@@ -10,6 +10,9 @@ struct TestInput {
     value: u8,
 }
 
+const A: TestInput = TestInput { value: 1 };
+const B: TestInput = TestInput { value: 2 };
+
 struct TestConfig;
 
 impl Config for TestConfig {
@@ -377,4 +380,360 @@ fn missing_mandatory_save_state_maps_to_snapshot_unavailable() {
         session.replace_past_input(0, 0, expected, TestInput { value: 2 }),
         Err(ExternalInputReplacementError::SnapshotUnavailable)
     );
+}
+
+#[derive(Debug, PartialEq)]
+struct TraceEntry {
+    request: &'static str,
+    frame: i32,
+    input: Option<(TestInput, InputStatus)>,
+}
+
+struct Driver {
+    frame: i32,
+    state: u32,
+    trace: Vec<TraceEntry>,
+}
+
+impl Driver {
+    fn new() -> Self {
+        Self {
+            frame: 0,
+            state: 7,
+            trace: Vec::new(),
+        }
+    }
+
+    fn process(&mut self, requests: Vec<GgrsRequest<TestConfig>>) {
+        for request in requests {
+            match request {
+                GgrsRequest::SaveGameState { cell, frame } => {
+                    self.trace.push(TraceEntry {
+                        request: "SaveGameState",
+                        frame,
+                        input: None,
+                    });
+                    cell.save(frame, Some(self.state), None);
+                }
+                GgrsRequest::LoadGameState { cell, frame } => {
+                    self.trace.push(TraceEntry {
+                        request: "LoadGameState",
+                        frame,
+                        input: None,
+                    });
+                    self.state = cell.load().unwrap();
+                    self.frame = frame;
+                }
+                GgrsRequest::AdvanceFrame { inputs } => {
+                    assert_eq!(inputs.len(), 1);
+                    self.trace.push(TraceEntry {
+                        request: "AdvanceFrame",
+                        frame: self.frame,
+                        input: Some(inputs[0]),
+                    });
+                    self.state = self
+                        .state
+                        .wrapping_mul(31)
+                        .wrapping_add(inputs[0].0.value as u32 + 1);
+                    self.frame += 1;
+                }
+            }
+        }
+    }
+}
+
+fn advance_with_driver(
+    session: &mut ExternalSession<TestConfig>,
+    driver: &mut Driver,
+    input: Option<TestInput>,
+) {
+    driver.process(session.advance_frame(&[input]).unwrap());
+}
+
+#[test]
+fn replacement_replays_predicted_frame_before_forward_advance() {
+    let mut session = single_player_session();
+    let mut driver = Driver::new();
+    advance_with_driver(&mut session, &mut driver, None);
+    let expected = session.input_state(0, 0).unwrap();
+    assert_eq!(expected.input(), TestInput::default());
+    assert_eq!(expected.provenance(), ExternalInputProvenance::Predicted);
+    session.replace_past_input(0, 0, expected, A).unwrap();
+    driver.trace.clear();
+
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+
+    assert_eq!(
+        driver.trace,
+        vec![
+            TraceEntry {
+                request: "LoadGameState",
+                frame: 0,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 0,
+                input: Some((A, InputStatus::Confirmed)),
+            },
+            TraceEntry {
+                request: "SaveGameState",
+                frame: 1,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 1,
+                input: Some((TestInput::default(), InputStatus::Confirmed)),
+            },
+        ]
+    );
+    assert_eq!(session.current_frame(), 2);
+    let expected_state = 7u32
+        .wrapping_mul(31)
+        .wrapping_add(A.value as u32 + 1)
+        .wrapping_mul(31)
+        .wrapping_add(1);
+    assert_eq!(driver.state, expected_state);
+
+    let mut control_session = single_player_session();
+    let mut control_driver = Driver::new();
+    advance_with_driver(&mut control_session, &mut control_driver, Some(A));
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    assert_eq!(driver.state, control_driver.state);
+    driver.trace.clear();
+    control_driver.trace.clear();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    assert!(!driver
+        .trace
+        .iter()
+        .any(|entry| entry.request == "LoadGameState"));
+    assert_eq!(driver.state, control_driver.state);
+}
+
+#[test]
+fn replacement_replays_authoritative_frame_with_new_input() {
+    let mut session = single_player_session();
+    let mut driver = Driver::new();
+    advance_with_driver(&mut session, &mut driver, Some(A));
+    let expected = session.input_state(0, 0).unwrap();
+    assert_eq!(expected.input(), A);
+    assert_eq!(
+        expected.provenance(),
+        ExternalInputProvenance::Authoritative
+    );
+    session
+        .replace_past_input(
+            0,
+            0,
+            expected,
+            TestInput {
+                value: A.value | B.value,
+            },
+        )
+        .unwrap();
+    driver.trace.clear();
+
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+
+    assert_eq!(
+        driver.trace,
+        vec![
+            TraceEntry {
+                request: "LoadGameState",
+                frame: 0,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 0,
+                input: Some((TestInput { value: 3 }, InputStatus::Confirmed)),
+            },
+            TraceEntry {
+                request: "SaveGameState",
+                frame: 1,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 1,
+                input: Some((TestInput::default(), InputStatus::Confirmed)),
+            },
+        ]
+    );
+    assert_eq!(session.current_frame(), 2);
+    let expected_state = 7u32
+        .wrapping_mul(31)
+        .wrapping_add(4)
+        .wrapping_mul(31)
+        .wrapping_add(1);
+    assert_eq!(driver.state, expected_state);
+
+    let mut control_session = single_player_session();
+    let mut control_driver = Driver::new();
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput { value: 3 }),
+    );
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    assert_eq!(driver.state, control_driver.state);
+    driver.trace.clear();
+    control_driver.trace.clear();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    assert!(!driver
+        .trace
+        .iter()
+        .any(|entry| entry.request == "LoadGameState"));
+    assert_eq!(driver.state, control_driver.state);
+}
+
+#[test]
+fn replacement_before_prediction_window_is_snapshot_unavailable_and_atomic() {
+    let mut session = SessionBuilder::<TestConfig>::new()
+        .with_rollback_history_frames(2)
+        .with_num_players(1)
+        .unwrap()
+        .start_external_session();
+    let mut driver = Driver::new();
+    for _ in 0..3 {
+        advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    }
+    let expected = session.input_state(0, 0).unwrap();
+    assert_eq!(
+        session.replace_past_input(0, 0, expected, A),
+        Err(ExternalInputReplacementError::SnapshotUnavailable)
+    );
+    assert_eq!(session.input_state(0, 0).unwrap(), expected);
+    driver.trace.clear();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    assert!(!driver
+        .trace
+        .iter()
+        .any(|entry| entry.request == "LoadGameState"));
+}
+
+#[test]
+fn zero_history_rejects_every_past_replacement() {
+    let mut session = SessionBuilder::<TestConfig>::new()
+        .with_rollback_history_frames(0)
+        .with_num_players(1)
+        .unwrap()
+        .start_external_session();
+    let mut driver = Driver::new();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    let expected = session.input_state(0, 0).unwrap();
+    let before = expected;
+
+    assert_eq!(
+        session.replace_past_input(0, 0, expected, A),
+        Err(ExternalInputReplacementError::SnapshotUnavailable)
+    );
+    assert_eq!(session.input_state(0, 0).unwrap(), before);
+    driver.trace.clear();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    assert!(!driver
+        .trace
+        .iter()
+        .any(|entry| entry.request == "LoadGameState"));
+}
+
+#[test]
+fn oldest_frame_inside_prediction_window_remains_replayable() {
+    let mut session = SessionBuilder::<TestConfig>::new()
+        .with_rollback_history_frames(2)
+        .with_num_players(1)
+        .unwrap()
+        .start_external_session();
+    let mut driver = Driver::new();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+    let expected = session.input_state(0, 1).unwrap();
+
+    assert!(matches!(
+        session.replace_past_input(0, 1, expected, A),
+        Ok(ExternalInputReplacement::Replaced(_))
+    ));
+    driver.trace.clear();
+    advance_with_driver(&mut session, &mut driver, Some(TestInput::default()));
+
+    assert_eq!(
+        driver.trace,
+        vec![
+            TraceEntry {
+                request: "LoadGameState",
+                frame: 1,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 1,
+                input: Some((A, InputStatus::Confirmed)),
+            },
+            TraceEntry {
+                request: "SaveGameState",
+                frame: 2,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 2,
+                input: Some((TestInput::default(), InputStatus::Confirmed)),
+            },
+            TraceEntry {
+                request: "SaveGameState",
+                frame: 3,
+                input: None,
+            },
+            TraceEntry {
+                request: "AdvanceFrame",
+                frame: 3,
+                input: Some((TestInput::default(), InputStatus::Confirmed)),
+            },
+        ]
+    );
+    assert_eq!(session.current_frame(), 4);
+
+    let mut control_session = SessionBuilder::<TestConfig>::new()
+        .with_rollback_history_frames(2)
+        .with_num_players(1)
+        .unwrap()
+        .start_external_session();
+    let mut control_driver = Driver::new();
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    advance_with_driver(&mut control_session, &mut control_driver, Some(A));
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    advance_with_driver(
+        &mut control_session,
+        &mut control_driver,
+        Some(TestInput::default()),
+    );
+    assert_eq!(driver.state, control_driver.state);
 }

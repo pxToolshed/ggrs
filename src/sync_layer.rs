@@ -306,6 +306,9 @@ impl<T: Config> SyncLayer<T> {
         if frame <= self.closed_through {
             return Err(InputReplacementError::Finalized);
         }
+        if frame < self.current_frame - self.max_prediction as Frame {
+            return Err(InputReplacementError::SnapshotOutOfRetention);
+        }
         if self.input_queues[player_handle as usize]
             .slot_state(frame)
             .is_none()

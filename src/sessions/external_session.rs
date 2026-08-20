@@ -1,7 +1,7 @@
 use crate::{
     input_queue::{InputProvenance, InputReplacementError, InputReplacementResult, VersionedInput},
     sync_layer::SyncLayer,
-    Config, Frame, GgrsError, GgrsRequest, PlayerHandle,
+    Config, Frame, GgrsError, GgrsRequest, PlayerHandle, NULL_FRAME,
 };
 
 /// Identifies whether an external input was predicted or authoritative.
@@ -186,6 +186,13 @@ impl<T: Config> ExternalSession<T> {
             });
         }
 
+        let first_incorrect = self.sync_layer.check_simulation_consistency(NULL_FRAME);
+        let mut requests = if first_incorrect != NULL_FRAME {
+            self.replay_to_current_frame(first_incorrect)
+        } else {
+            Vec::new()
+        };
+
         let frame = self.current_frame();
         let history = self.rollback_history_frames() as Frame;
         let trim_through = if frame > history {
@@ -207,14 +214,30 @@ impl<T: Config> ExternalSession<T> {
                 .append_external_input(handle as _, frame, input, provenance);
         }
 
-        let requests = vec![
-            self.sync_layer.save_current_state(),
-            GgrsRequest::AdvanceFrame {
-                inputs: self.sync_layer.external_inputs(frame),
-            },
-        ];
+        requests.push(self.sync_layer.save_current_state());
+        requests.push(GgrsRequest::AdvanceFrame {
+            inputs: self.sync_layer.external_inputs(frame),
+        });
         self.sync_layer.advance_frame();
         Ok(requests)
+    }
+
+    fn replay_to_current_frame(&mut self, first_incorrect: Frame) -> Vec<GgrsRequest<T>> {
+        let old_current_frame = self.current_frame();
+        let mut requests = vec![self.sync_layer.load_frame(first_incorrect)];
+        self.sync_layer.reset_prediction();
+        while self.current_frame() < old_current_frame {
+            let replay_frame = self.current_frame();
+            if replay_frame > first_incorrect {
+                requests.push(self.sync_layer.save_current_state());
+            }
+            requests.push(GgrsRequest::AdvanceFrame {
+                inputs: self.sync_layer.external_inputs(replay_frame),
+            });
+            self.sync_layer.advance_frame();
+        }
+        debug_assert_eq!(self.current_frame(), old_current_frame);
+        requests
     }
 }
 
