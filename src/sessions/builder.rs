@@ -4,8 +4,8 @@ use instant::Duration;
 
 use crate::{
     network::protocol::UdpProtocol, sessions::p2p_session::PlayerRegistry, Config, DesyncDetection,
-    GgrsError, NonBlockingSocket, P2PSession, PlayerHandle, PlayerType, SpectatorSession,
-    SyncTestSession,
+    ExternalSession, GgrsError, NonBlockingSocket, P2PSession, PlayerHandle, PlayerType,
+    SpectatorSession, SyncTestSession,
 };
 
 // The amount of inputs a spectator can buffer (a second worth of inputs at 60 FPS)
@@ -38,6 +38,7 @@ where
     num_players: usize,
     local_players: usize,
     max_prediction: usize,
+    rollback_history_frames: usize,
     /// FPS defines the expected update frequency of this session.
     fps: usize,
     sparse_saving: bool,
@@ -67,6 +68,7 @@ impl<T: Config> SessionBuilder<T> {
             local_players: 0,
             num_players: DEFAULT_PLAYERS,
             max_prediction: DEFAULT_MAX_PREDICTION_FRAMES,
+            rollback_history_frames: DEFAULT_MAX_PREDICTION_FRAMES,
             fps: DEFAULT_FPS,
             sparse_saving: DEFAULT_SAVE_MODE,
             desync_detection: DEFAULT_DETECTION_MODE,
@@ -157,6 +159,14 @@ impl<T: Config> SessionBuilder<T> {
     /// `F + D`.
     pub fn with_max_prediction_window(mut self, window: usize) -> Self {
         self.max_prediction = window;
+        self
+    }
+
+    /// Set the number of previous frames available for external-session rollback.
+    ///
+    /// The current frame is stored separately, and zero is valid. Default is 8.
+    pub fn with_rollback_history_frames(mut self, frames: usize) -> Self {
+        self.rollback_history_frames = frames;
         self
     }
 
@@ -377,6 +387,11 @@ impl<T: Config> SessionBuilder<T> {
             self.input_delay,
             self.fps,
         ))
+    }
+
+    /// Consumes the builder to construct a transport-free external session.
+    pub fn start_external_session(self) -> ExternalSession<T> {
+        ExternalSession::new(self.num_players, self.rollback_history_frames)
     }
 
     /// Consumes the builder to create a new [`SpectatorSession`].

@@ -201,6 +201,14 @@ impl<T: Config> SyncLayer<T> {
         self.current_frame
     }
 
+    pub(crate) fn num_players(&self) -> usize {
+        self.num_players
+    }
+
+    pub(crate) fn rollback_history_frames(&self) -> usize {
+        self.max_prediction
+    }
+
     pub(crate) fn advance_frame(&mut self) {
         self.current_frame += 1;
     }

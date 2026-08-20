@@ -89,6 +89,7 @@
 //! | [`P2PSession`] | Main multiplayer session; connects peers directly. |
 //! | [`SpectatorSession`] | Watch a game without contributing input. |
 //! | [`SyncTestSession`] | Local determinism testing; no network required. |
+//! | [`ExternalSession`] | Transport-free synchronization state with configurable rollback history. |
 //!
 //! All session types are constructed with [`SessionBuilder`].
 //!
@@ -117,6 +118,7 @@ pub use network::network_stats::NetworkStats;
 pub use network::udp_socket::UdpNonBlockingSocket;
 use serde::{de::DeserializeOwned, Serialize};
 pub use sessions::builder::SessionBuilder;
+pub use sessions::external_session::ExternalSession;
 pub use sessions::p2p_session::P2PSession;
 pub use sessions::p2p_spectator_session::SpectatorSession;
 pub use sessions::sync_test_session::SyncTestSession;
@@ -129,6 +131,7 @@ pub(crate) mod sync_layer;
 pub(crate) mod time_sync;
 pub(crate) mod sessions {
     pub(crate) mod builder;
+    pub(crate) mod external_session;
     pub(crate) mod p2p_session;
     pub(crate) mod p2p_spectator_session;
     pub(crate) mod sync_test_session;

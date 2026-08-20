@@ -1,6 +1,6 @@
 # Sessions
 
-GGRS provides three session types. All are constructed with [`SessionBuilder`](https://docs.rs/ggrs/latest/ggrs/struct.SessionBuilder.html).
+GGRS provides four session types. All are constructed with [`SessionBuilder`](https://docs.rs/ggrs/latest/ggrs/struct.SessionBuilder.html).
 
 ## Session Types
 
@@ -15,6 +15,10 @@ Connects to an existing host running a `P2PSession`. The host broadcasts all con
 ### `SyncTestSession`
 
 A local-only session for testing determinism. On every frame, GGRS simulates a rollback and re-runs the last *n* frames (where *n* is the check distance), then compares checksums. No network is involved. Use this during development to verify that your save/load/advance logic is correct and deterministic.
+
+### `ExternalSession`
+
+A transport-free session exposing synchronization state for external integrations. Construct it with `start_external_session`; it does not add players, open sockets, or advance frames. Configure the number of previous frames available for rollback with `with_rollback_history_frames` (default 8, zero is valid; the current frame is stored separately).
 
 ---
 
@@ -61,6 +65,15 @@ let mut session = SessionBuilder::<GgrsConfig>::new()
     .start_synctest_session()?;
 ```
 
+### External Session
+
+```rust
+let session = SessionBuilder::<GgrsConfig>::new()
+    .with_num_players(2)?
+    .with_rollback_history_frames(12)
+    .start_external_session();
+```
+
 ---
 
 ## Common Builder Options
@@ -71,6 +84,7 @@ let mut session = SessionBuilder::<GgrsConfig>::new()
 | `with_fps(fps)` | 60 | Expected update frequency. Used for frame synchronization heuristics. |
 | `with_input_delay(n)` | 0 | Frames of artificial delay applied to local input. Reduces rollbacks in rollback mode. In lockstep mode, this schedules local input ahead while the public session frame remains the game frame. |
 | `with_max_prediction_window(n)` | 8 | Maximum frames GGRS will predict ahead. Set to `0` for conservative lockstep mode: no prediction, no rollbacks, game stalls until all remote inputs are confirmed. Use `P2PSession::advance_frame_with_wait` for a bounded wait that can reduce poll-phase stalls. |
+| `with_rollback_history_frames(n)` | 8 | Number of previous frames available for rollback in an `ExternalSession`. The current frame is stored separately; `0` is valid. |
 | `with_sparse_saving_mode(bool)` | false | Only save state at the last confirmed frame. See [Sparse Saving](sparse-saving.md). |
 | `with_desync_detection_mode(mode)` | Off | Enable checksum-based desync detection. `DesyncDetection::On` requires an interval higher than 0. See [`DesyncDetection`](https://docs.rs/ggrs/latest/ggrs/enum.DesyncDetection.html). |
 | `with_disconnect_timeout(duration)` | 2s | How long without packets before a remote peer is disconnected. |
