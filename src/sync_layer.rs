@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::frame_info::{GameState, PlayerInput};
 use crate::input_queue::{
-    InputQueue, InputReplacementError, InputReplacementResult, VersionedInput,
+    InputProvenance, InputQueue, InputReplacementError, InputReplacementResult, VersionedInput,
 };
 use crate::network::messages::ConnectionStatus;
 use crate::{Config, Frame, GgrsRequest, InputStatus, PlayerHandle, NULL_FRAME};
@@ -247,6 +247,33 @@ impl<T: Config> SyncLayer<T> {
             return Err(InputReplacementError::InvalidFrame);
         }
         self.input_queues[player_handle as usize].materialize_predicted(frame, input)
+    }
+
+    pub(crate) fn preflight_external_inputs(&self, frame: Frame, trim_through: Frame) -> bool {
+        self.input_queues
+            .iter()
+            .all(|queue| queue.can_append_after_trim(frame, trim_through))
+    }
+
+    pub(crate) fn append_external_input(
+        &mut self,
+        player_handle: PlayerHandle,
+        frame: Frame,
+        input: T::Input,
+        provenance: InputProvenance,
+    ) {
+        self.input_queues[player_handle as usize].append_sequential(frame, input, provenance);
+    }
+
+    pub(crate) fn external_inputs(&self, frame: Frame) -> Vec<(T::Input, InputStatus)> {
+        self.input_queues
+            .iter()
+            .map(|queue| {
+                queue
+                    .current_input(frame)
+                    .expect("external frame was not materialized")
+            })
+            .collect()
     }
 
     pub(crate) fn replace_past_input(

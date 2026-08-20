@@ -3,7 +3,8 @@ use crate::{Config, Frame, InputPredictor, InputStatus, NULL_FRAME};
 use std::cmp;
 
 /// The length of the input queue. This describes the number of inputs GGRS can hold at the same time per player.
-const INPUT_QUEUE_LENGTH: usize = 128;
+pub(crate) const INPUT_QUEUE_LENGTH: usize = 128;
+pub(crate) const MAX_ROLLBACK_HISTORY_FRAMES: usize = INPUT_QUEUE_LENGTH - 1;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum InputProvenance {
@@ -236,11 +237,44 @@ impl<T: Config> InputQueue<T> {
         if self.length == INPUT_QUEUE_LENGTH {
             return Err(InputReplacementError::OutOfRetention);
         }
+        self.append_sequential(frame, input, InputProvenance::Predicted);
+        Ok(())
+    }
+
+    pub(crate) fn can_append_after_trim(&self, frame: Frame, trim_through: Frame) -> bool {
+        if frame < 0 || (!self.first_frame && frame != self.last_added_frame + 1) {
+            return false;
+        }
+        let retained_after_trim = (0..INPUT_QUEUE_LENGTH)
+            .filter(|&offset| {
+                self.retained_index(offset) && self.inputs[offset].frame > trim_through
+            })
+            .count();
+        retained_after_trim < INPUT_QUEUE_LENGTH
+    }
+
+    pub(crate) fn current_input(&self, frame: Frame) -> Option<(T::Input, InputStatus)> {
+        let slot = self.slot_state(frame)?;
+        let status = match slot.provenance {
+            InputProvenance::Predicted => InputStatus::Predicted,
+            InputProvenance::Authoritative => InputStatus::Confirmed,
+        };
+        Some((slot.input, status))
+    }
+
+    pub(crate) fn append_sequential(
+        &mut self,
+        frame: Frame,
+        input: T::Input,
+        provenance: InputProvenance,
+    ) {
+        debug_assert!(self.first_frame || frame == self.last_added_frame + 1);
+        assert!(self.length < INPUT_QUEUE_LENGTH);
         let offset = self.head;
         self.inputs[offset] = PlayerInput::new(frame, input);
         self.slots[offset] = VersionedInput {
             input,
-            provenance: InputProvenance::Predicted,
+            provenance,
             revision: 0,
         };
         self.last_transitions[offset] = None;
@@ -248,7 +282,6 @@ impl<T: Config> InputQueue<T> {
         self.length += 1;
         self.first_frame = false;
         self.last_added_frame = frame;
-        Ok(())
     }
 
     pub(crate) fn trim_external_through(&mut self, frame: Frame) {
@@ -426,19 +459,7 @@ impl<T: Config> InputQueue<T> {
         assert!(frame_number == 0 || self.inputs[previous_position].frame == frame_number - 1);
 
         // Add the frame to the back of the queue
-        self.inputs[self.head] = input;
-        self.inputs[self.head].frame = frame_number;
-        self.slots[self.head] = VersionedInput {
-            input: input.input,
-            provenance: InputProvenance::Authoritative,
-            revision: 0,
-        };
-        self.last_transitions[self.head] = None;
-        self.head = (self.head + 1) % INPUT_QUEUE_LENGTH;
-        self.length += 1;
-        assert!(self.length <= INPUT_QUEUE_LENGTH);
-        self.first_frame = false;
-        self.last_added_frame = frame_number;
+        self.append_sequential(frame_number, input.input, InputProvenance::Authoritative);
 
         // We have been predicting. See if the inputs we've gotten match what we've been predicting. If so, don't worry about it.
         if self.prediction.frame != NULL_FRAME {
@@ -500,6 +521,7 @@ impl<T: Config> InputQueue<T> {
 mod input_queue_tests {
 
     use std::net::SocketAddr;
+    use std::panic::AssertUnwindSafe;
 
     use serde::{Deserialize, Serialize};
 
@@ -597,6 +619,74 @@ mod input_queue_tests {
         // prediction should repeat the last real input
         let (predicted, _status) = queue.input(1);
         assert_eq!(predicted.inp, 77);
+    }
+
+    #[test]
+    fn shared_append_preserves_sequential_submission_and_prediction_mismatch() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        assert_eq!(
+            queue.add_input(PlayerInput::new(0, TestInput { inp: 5 })),
+            0
+        );
+        assert_eq!(queue.input(1).0.inp, 5);
+        assert_eq!(
+            queue.add_input(PlayerInput::new(2, TestInput { inp: 99 })),
+            NULL_FRAME
+        );
+        assert_eq!(
+            queue.add_input(PlayerInput::new(1, TestInput { inp: 99 })),
+            1
+        );
+        assert_eq!(queue.first_incorrect_frame(), 1);
+    }
+
+    #[test]
+    fn full_queue_requires_trim_before_shared_append() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        for frame in 0..INPUT_QUEUE_LENGTH as Frame {
+            assert_eq!(
+                queue.add_input(PlayerInput::new(frame, TestInput { inp: 1 })),
+                frame
+            );
+        }
+        assert_eq!(queue.length, INPUT_QUEUE_LENGTH);
+        assert!(!queue.can_append_after_trim(INPUT_QUEUE_LENGTH as Frame, -1));
+        assert!(queue.can_append_after_trim(INPUT_QUEUE_LENGTH as Frame, 0));
+
+        let before = (
+            queue.head,
+            queue.tail,
+            queue.length,
+            queue.last_added_frame,
+            queue.inputs.clone(),
+            queue.slots.clone(),
+        );
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            queue.append_sequential(
+                INPUT_QUEUE_LENGTH as Frame,
+                TestInput { inp: 9 },
+                InputProvenance::Authoritative,
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            (queue.head, queue.tail, queue.length, queue.last_added_frame,),
+            (before.0, before.1, before.2, before.3)
+        );
+        assert_eq!(&queue.inputs, &before.4);
+        assert_eq!(&queue.slots, &before.5);
+
+        queue.trim_external_through(0);
+        assert!(queue.can_append_after_trim(INPUT_QUEUE_LENGTH as Frame, 0));
+        queue.append_sequential(
+            INPUT_QUEUE_LENGTH as Frame,
+            TestInput { inp: 9 },
+            InputProvenance::Authoritative,
+        );
+        assert_eq!(
+            queue.current_input(INPUT_QUEUE_LENGTH as Frame),
+            Some((TestInput { inp: 9 }, InputStatus::Confirmed))
+        );
     }
 
     #[test]

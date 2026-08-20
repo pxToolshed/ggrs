@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use instant::Duration;
 
 use crate::{
-    network::protocol::UdpProtocol, sessions::p2p_session::PlayerRegistry, Config, DesyncDetection,
-    ExternalSession, GgrsError, NonBlockingSocket, P2PSession, PlayerHandle, PlayerType,
-    SpectatorSession, SyncTestSession,
+    input_queue::MAX_ROLLBACK_HISTORY_FRAMES, network::protocol::UdpProtocol,
+    sessions::p2p_session::PlayerRegistry, Config, DesyncDetection, ExternalSession, GgrsError,
+    NonBlockingSocket, P2PSession, PlayerHandle, PlayerType, SpectatorSession, SyncTestSession,
 };
 
 // The amount of inputs a spectator can buffer (a second worth of inputs at 60 FPS)
@@ -165,7 +165,14 @@ impl<T: Config> SessionBuilder<T> {
     /// Set the number of previous frames available for external-session rollback.
     ///
     /// The current frame is stored separately, and zero is valid. Default is 8.
+    ///
+    /// # Panics
+    /// Panics if `frames` is greater than 127, because input queues hold 128 frames.
     pub fn with_rollback_history_frames(mut self, frames: usize) -> Self {
+        assert!(
+            frames <= MAX_ROLLBACK_HISTORY_FRAMES,
+            "rollback history must be at most {MAX_ROLLBACK_HISTORY_FRAMES} frames"
+        );
         self.rollback_history_frames = frames;
         self
     }

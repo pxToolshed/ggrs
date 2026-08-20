@@ -1,4 +1,6 @@
-use crate::{sync_layer::SyncLayer, Config, Frame};
+use crate::{
+    input_queue::InputProvenance, sync_layer::SyncLayer, Config, Frame, GgrsError, GgrsRequest,
+};
 
 /// A transport-free session backed by GGRS synchronization state.
 pub struct ExternalSession<T>
@@ -28,6 +30,58 @@ impl<T: Config> ExternalSession<T> {
     /// Returns the current session frame.
     pub fn current_frame(&self) -> Frame {
         self.sync_layer.current_frame()
+    }
+
+    /// Advances one frame without transport.
+    ///
+    /// `None` uses the input default but marks it as predicted; `Some` marks the input as
+    /// authoritative, including when it contains the default value.
+    ///
+    /// # Errors
+    /// Returns [`GgrsError::InvalidRequest`] if `inputs.len()` does not equal `num_players()`.
+    pub fn advance_frame(
+        &mut self,
+        inputs: &[Option<T::Input>],
+    ) -> Result<Vec<GgrsRequest<T>>, GgrsError> {
+        if inputs.len() != self.num_players() {
+            return Err(GgrsError::InvalidRequest {
+                info: format!(
+                    "Expected {} inputs, got {}.",
+                    self.num_players(),
+                    inputs.len()
+                ),
+            });
+        }
+
+        let frame = self.current_frame();
+        let history = self.rollback_history_frames() as Frame;
+        let trim_through = if frame > history {
+            frame - history - 1
+        } else {
+            -1
+        };
+        assert!(self
+            .sync_layer
+            .preflight_external_inputs(frame, trim_through));
+        self.sync_layer.trim_external_retention(trim_through);
+
+        for (handle, input) in inputs.iter().enumerate() {
+            let (input, provenance) = match input {
+                Some(input) => (*input, InputProvenance::Authoritative),
+                None => (T::Input::default(), InputProvenance::Predicted),
+            };
+            self.sync_layer
+                .append_external_input(handle as _, frame, input, provenance);
+        }
+
+        let requests = vec![
+            self.sync_layer.save_current_state(),
+            GgrsRequest::AdvanceFrame {
+                inputs: self.sync_layer.external_inputs(frame),
+            },
+        ];
+        self.sync_layer.advance_frame();
+        Ok(requests)
     }
 }
 
