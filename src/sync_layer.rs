@@ -3,7 +3,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::frame_info::{GameState, PlayerInput};
-use crate::input_queue::InputQueue;
+use crate::input_queue::{
+    InputQueue, InputReplacementError, InputReplacementResult, VersionedInput,
+};
 use crate::network::messages::ConnectionStatus;
 use crate::{Config, Frame, GgrsRequest, InputStatus, PlayerHandle, NULL_FRAME};
 
@@ -171,6 +173,7 @@ where
     last_confirmed_frame: Frame,
     last_saved_frame: Frame,
     current_frame: Frame,
+    closed_through: Frame,
     input_queues: Vec<InputQueue<T>>,
 }
 
@@ -188,6 +191,7 @@ impl<T: Config> SyncLayer<T> {
             last_confirmed_frame: NULL_FRAME,
             last_saved_frame: NULL_FRAME,
             current_frame: 0,
+            closed_through: NULL_FRAME,
             saved_states: SavedStates::new(max_prediction),
             input_queues,
         }
@@ -199,6 +203,73 @@ impl<T: Config> SyncLayer<T> {
 
     pub(crate) fn advance_frame(&mut self) {
         self.current_frame += 1;
+    }
+
+    pub(crate) fn closed_through(&self) -> Frame {
+        self.closed_through
+    }
+
+    pub(crate) fn advance_closed_through(&mut self, frame: Frame) {
+        if frame < 0 || self.current_frame == 0 {
+            return;
+        }
+        self.closed_through = self.closed_through.max(frame.min(self.current_frame - 1));
+    }
+
+    pub(crate) fn trim_external_retention(&mut self, frame: Frame) {
+        for queue in &mut self.input_queues {
+            queue.trim_external_through(frame);
+        }
+    }
+
+    pub(crate) fn saved_state_is_loadable(&self, frame: Frame) -> bool {
+        frame >= 0 && self.saved_state_by_frame(frame).is_some()
+    }
+
+    pub(crate) fn materialize_predicted_input(
+        &mut self,
+        player_handle: PlayerHandle,
+        frame: Frame,
+        input: T::Input,
+    ) -> Result<(), InputReplacementError> {
+        if player_handle >= self.num_players as PlayerHandle {
+            return Err(InputReplacementError::InvalidHandle);
+        }
+        if frame < 0 {
+            return Err(InputReplacementError::InvalidFrame);
+        }
+        self.input_queues[player_handle as usize].materialize_predicted(frame, input)
+    }
+
+    pub(crate) fn replace_past_input(
+        &mut self,
+        player_handle: PlayerHandle,
+        frame: Frame,
+        expected: VersionedInput<T::Input>,
+        input: T::Input,
+    ) -> Result<InputReplacementResult, InputReplacementError> {
+        if player_handle >= self.num_players as PlayerHandle {
+            return Err(InputReplacementError::InvalidHandle);
+        }
+        if frame < 0 {
+            return Err(InputReplacementError::InvalidFrame);
+        }
+        if frame >= self.current_frame {
+            return Err(InputReplacementError::NotPast);
+        }
+        if frame <= self.closed_through {
+            return Err(InputReplacementError::Finalized);
+        }
+        if self.input_queues[player_handle as usize]
+            .slot_state(frame)
+            .is_none()
+        {
+            return Err(InputReplacementError::OutOfRetention);
+        }
+        if !self.saved_state_is_loadable(frame) {
+            return Err(InputReplacementError::SnapshotOutOfRetention);
+        }
+        self.input_queues[player_handle as usize].replace_past_slot(frame, expected, input)
     }
 
     pub(crate) fn save_current_state(&mut self) -> GgrsRequest<T> {
@@ -354,6 +425,9 @@ impl<T: Config> SyncLayer<T> {
 
     /// Returns a gamestate through given frame
     pub(crate) fn saved_state_by_frame(&self, frame: Frame) -> Option<GameStateCell<T::State>> {
+        if frame < 0 {
+            return None;
+        }
         let cell = self.saved_states.get_cell(frame);
 
         if cell.0.lock().frame == frame {
@@ -408,7 +482,7 @@ mod sync_layer_tests {
     use std::net::SocketAddr;
 
     #[repr(C)]
-    #[derive(Copy, Clone, PartialEq, Default, Serialize, Deserialize)]
+    #[derive(Debug, Copy, Clone, PartialEq, Default, Serialize, Deserialize)]
     struct TestInput {
         inp: u8,
     }
@@ -664,5 +738,154 @@ mod sync_layer_tests {
         assert_eq!(inputs[0].1, InputStatus::Confirmed);
         assert_eq!(inputs[1].1, InputStatus::Disconnected);
         assert_eq!(inputs[1].0.inp, 0); // default
+    }
+
+    #[test]
+    fn test_external_replacement_preflight_and_finality() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let save = sync_layer.save_current_state();
+        if let GgrsRequest::SaveGameState { cell, frame } = save {
+            cell.save(frame, Some(0), None);
+        }
+        sync_layer
+            .materialize_predicted_input(0, 0, TestInput { inp: 1 })
+            .unwrap();
+        let expected = sync_layer.input_queues[0].slot_state(0).unwrap();
+        sync_layer.advance_frame();
+        sync_layer.advance_frame();
+        sync_layer.add_remote_input(0, PlayerInput::new(1, TestInput { inp: 1 }));
+        let frame_one = sync_layer.input_queues[0].slot_state(1).unwrap();
+
+        assert_eq!(
+            sync_layer.replace_past_input(1, 0, expected, TestInput { inp: 2 }),
+            Err(InputReplacementError::InvalidHandle)
+        );
+        assert_eq!(
+            sync_layer.replace_past_input(0, 1, frame_one, TestInput { inp: 2 }),
+            Err(InputReplacementError::SnapshotOutOfRetention)
+        );
+        assert_eq!(
+            sync_layer.replace_past_input(0, 2, expected, TestInput { inp: 2 }),
+            Err(InputReplacementError::NotPast)
+        );
+        sync_layer.advance_closed_through(0);
+        assert_eq!(
+            sync_layer.replace_past_input(0, 0, expected, TestInput { inp: 2 }),
+            Err(InputReplacementError::Finalized)
+        );
+        assert_eq!(sync_layer.last_confirmed_frame(), NULL_FRAME);
+    }
+
+    #[test]
+    fn test_external_finality_clamps_and_is_independent_from_trim() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        for frame in 0..3 {
+            sync_layer
+                .materialize_predicted_input(0, frame, TestInput { inp: frame as u8 })
+                .unwrap();
+        }
+        assert_eq!(sync_layer.closed_through(), NULL_FRAME);
+        sync_layer.advance_frame();
+        sync_layer.advance_frame();
+        sync_layer.advance_frame();
+        sync_layer.advance_closed_through(4);
+        assert_eq!(sync_layer.closed_through(), 2);
+        sync_layer.advance_closed_through(0);
+        assert_eq!(sync_layer.closed_through(), 2);
+        sync_layer.advance_closed_through(NULL_FRAME);
+        assert_eq!(sync_layer.closed_through(), 2);
+        assert!(sync_layer.input_queues[0].slot_state(0).is_some());
+        assert!(sync_layer.input_queues[0].slot_state(2).is_some());
+        assert_eq!(sync_layer.last_confirmed_frame(), NULL_FRAME);
+    }
+
+    #[test]
+    fn external_trim_does_not_advance_finality() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        for frame in 0..3 {
+            sync_layer
+                .materialize_predicted_input(0, frame, TestInput { inp: frame as u8 })
+                .unwrap();
+        }
+        sync_layer.advance_frame();
+        sync_layer.advance_frame();
+        sync_layer.advance_frame();
+        sync_layer.trim_external_retention(1);
+        assert_eq!(sync_layer.closed_through(), NULL_FRAME);
+        assert!(sync_layer.input_queues[0].slot_state(0).is_none());
+        assert!(sync_layer.input_queues[0].slot_state(1).is_none());
+        assert!(sync_layer.input_queues[0].slot_state(2).is_some());
+    }
+
+    #[test]
+    fn past_boundaries_are_rejected_atomically() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let save = sync_layer.save_current_state();
+        if let GgrsRequest::SaveGameState { cell, frame } = save {
+            cell.save(frame, None, None);
+        }
+        sync_layer
+            .materialize_predicted_input(0, 0, TestInput::default())
+            .unwrap();
+        let expected = sync_layer.input_queues[0].slot_state(0).unwrap();
+        sync_layer.advance_frame();
+        let before = sync_layer.input_queues[0].slot_state(0);
+        assert_eq!(
+            sync_layer.replace_past_input(0, 1, expected, TestInput { inp: 1 }),
+            Err(InputReplacementError::NotPast)
+        );
+        assert_eq!(
+            sync_layer.replace_past_input(0, 2, expected, TestInput { inp: 1 }),
+            Err(InputReplacementError::NotPast)
+        );
+        assert_eq!(
+            sync_layer.replace_past_input(0, -2, expected, TestInput { inp: 1 }),
+            Err(InputReplacementError::InvalidFrame)
+        );
+        assert_eq!(
+            sync_layer.replace_past_input(1, 0, expected, TestInput { inp: 1 }),
+            Err(InputReplacementError::InvalidHandle)
+        );
+        assert_eq!(sync_layer.input_queues[0].slot_state(0), before);
+        assert_eq!(sync_layer.closed_through(), NULL_FRAME);
+    }
+
+    #[test]
+    fn input_retained_but_snapshot_missing() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        sync_layer
+            .materialize_predicted_input(0, 0, TestInput::default())
+            .unwrap();
+        let expected = sync_layer.input_queues[0].slot_state(0).unwrap();
+        sync_layer.advance_frame();
+        assert_eq!(
+            sync_layer.replace_past_input(0, 0, expected, TestInput { inp: 1 }),
+            Err(InputReplacementError::SnapshotOutOfRetention)
+        );
+        assert_eq!(sync_layer.input_queues[0].slot_state(0), Some(expected));
+        assert_eq!(sync_layer.closed_through(), NULL_FRAME);
+    }
+
+    #[test]
+    fn dense_snapshot_ring_reports_exact_frame_tags() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 2);
+        for frame in 0..3 {
+            let save = sync_layer.save_current_state();
+            if let GgrsRequest::SaveGameState { cell, frame: saved } = save {
+                assert_eq!(saved, frame);
+                cell.save(saved, None, None);
+            }
+            assert!(sync_layer.saved_state_is_loadable(frame));
+            sync_layer.advance_frame();
+        }
+        let save = sync_layer.save_current_state();
+        if let GgrsRequest::SaveGameState { cell, frame } = save {
+            assert_eq!(frame, 3);
+            cell.save(frame, None, None);
+        }
+        assert!(!sync_layer.saved_state_is_loadable(0));
+        assert!(sync_layer.saved_state_is_loadable(1));
+        assert!(sync_layer.saved_state_is_loadable(2));
+        assert!(sync_layer.saved_state_is_loadable(3));
     }
 }

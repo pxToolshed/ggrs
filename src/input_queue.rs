@@ -5,6 +5,44 @@ use std::cmp;
 /// The length of the input queue. This describes the number of inputs GGRS can hold at the same time per player.
 const INPUT_QUEUE_LENGTH: usize = 128;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum InputProvenance {
+    Predicted,
+    Authoritative,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) struct VersionedInput<I> {
+    pub input: I,
+    pub provenance: InputProvenance,
+    pub revision: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) struct InputTransition<I> {
+    pub expected: VersionedInput<I>,
+    pub replacement: VersionedInput<I>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum InputReplacementError {
+    InvalidHandle,
+    InvalidFrame,
+    NotPast,
+    Finalized,
+    SnapshotOutOfRetention,
+    OutOfRetention,
+    ExpectedStateMismatch,
+    Conflict,
+    RevisionOverflow,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum InputReplacementResult {
+    Replaced,
+    RetryNoOp,
+}
+
 /// `InputQueue` handles inputs for a single player and saves them in a circular array. Valid Inputs are between `head` and `tail`.
 #[derive(Debug, Clone)]
 pub(crate) struct InputQueue<T>
@@ -35,6 +73,8 @@ where
 
     /// Our cyclic input queue
     inputs: Vec<PlayerInput<T::Input>>,
+    slots: Vec<VersionedInput<T::Input>>,
+    last_transitions: Vec<Option<InputTransition<T::Input>>>,
     /// A pre-allocated prediction we are going to use to return predictions from.
     prediction: PlayerInput<T::Input>,
 }
@@ -61,11 +101,25 @@ impl<T: Config> InputQueue<T> {
             last_requested_frame: NULL_FRAME,
             prediction: PlayerInput::blank_input(NULL_FRAME),
             inputs: vec![PlayerInput::blank_input(NULL_FRAME); INPUT_QUEUE_LENGTH],
+            slots: vec![
+                VersionedInput {
+                    input: T::Input::default(),
+                    provenance: InputProvenance::Authoritative,
+                    revision: 0,
+                };
+                INPUT_QUEUE_LENGTH
+            ],
+            last_transitions: vec![None; INPUT_QUEUE_LENGTH],
         }
     }
 
     pub(crate) fn first_incorrect_frame(&self) -> Frame {
         self.first_incorrect_frame
+    }
+
+    fn retained_index(&self, offset: usize) -> bool {
+        self.length > 0
+            && (offset + INPUT_QUEUE_LENGTH - self.tail) % INPUT_QUEUE_LENGTH < self.length
     }
 
     /// Changes the frame delay and returns any fill inputs that were implicitly added to bridge the
@@ -93,6 +147,146 @@ impl<T: Config> InputQueue<T> {
         self.last_requested_frame = NULL_FRAME;
     }
 
+    pub(crate) fn slot_state(&self, frame: Frame) -> Option<VersionedInput<T::Input>> {
+        if frame < 0 {
+            return None;
+        }
+        let offset = frame as usize % INPUT_QUEUE_LENGTH;
+        let slot = &self.slots[offset];
+        (self.retained_index(offset) && self.inputs[offset].frame == frame).then_some(*slot)
+    }
+
+    pub(crate) fn replace_past_slot(
+        &mut self,
+        frame: Frame,
+        expected: VersionedInput<T::Input>,
+        input: T::Input,
+    ) -> Result<InputReplacementResult, InputReplacementError> {
+        if frame < 0 {
+            return Err(InputReplacementError::InvalidFrame);
+        }
+        let offset = frame as usize % INPUT_QUEUE_LENGTH;
+        if !self.retained_index(offset) || self.inputs[offset].frame != frame {
+            return Err(InputReplacementError::OutOfRetention);
+        }
+        let current = self.slots[offset];
+        if let Some(transition) = self.last_transitions[offset] {
+            if transition.expected == expected
+                && transition.replacement.input == input
+                && transition.replacement.provenance == InputProvenance::Authoritative
+                && current == transition.replacement
+            {
+                return Ok(InputReplacementResult::RetryNoOp);
+            }
+            if transition.expected == expected
+                && current == transition.replacement
+                && input != transition.replacement.input
+            {
+                return Err(InputReplacementError::Conflict);
+            }
+            if transition.replacement.input == input
+                && transition.replacement.provenance == InputProvenance::Authoritative
+                && current != expected
+            {
+                return Err(InputReplacementError::Conflict);
+            }
+        }
+        if current != expected {
+            return if current.input == input && current.provenance == InputProvenance::Authoritative
+            {
+                Err(InputReplacementError::Conflict)
+            } else {
+                Err(InputReplacementError::ExpectedStateMismatch)
+            };
+        }
+        if current.input == input && current.provenance == InputProvenance::Authoritative {
+            return Err(InputReplacementError::Conflict);
+        }
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(InputReplacementError::RevisionOverflow)?;
+        let replacement = VersionedInput {
+            input,
+            provenance: InputProvenance::Authoritative,
+            revision,
+        };
+        self.inputs[offset].input = input;
+        self.slots[offset] = replacement;
+        self.last_transitions[offset] = Some(InputTransition {
+            expected,
+            replacement,
+        });
+        if current.input != input
+            && (self.first_incorrect_frame == NULL_FRAME || frame < self.first_incorrect_frame)
+        {
+            self.first_incorrect_frame = frame;
+        }
+        Ok(InputReplacementResult::Replaced)
+    }
+
+    pub(crate) fn materialize_predicted(
+        &mut self,
+        frame: Frame,
+        input: T::Input,
+    ) -> Result<(), InputReplacementError> {
+        if frame < 0 || (!self.first_frame && frame != self.last_added_frame + 1) {
+            return Err(InputReplacementError::InvalidFrame);
+        }
+        if self.length == INPUT_QUEUE_LENGTH {
+            return Err(InputReplacementError::OutOfRetention);
+        }
+        let offset = self.head;
+        self.inputs[offset] = PlayerInput::new(frame, input);
+        self.slots[offset] = VersionedInput {
+            input,
+            provenance: InputProvenance::Predicted,
+            revision: 0,
+        };
+        self.last_transitions[offset] = None;
+        self.head = (self.head + 1) % INPUT_QUEUE_LENGTH;
+        self.length += 1;
+        self.first_frame = false;
+        self.last_added_frame = frame;
+        Ok(())
+    }
+
+    pub(crate) fn trim_external_through(&mut self, frame: Frame) {
+        if frame < 0 || self.length == 0 {
+            return;
+        }
+        let old_tail = self.tail;
+        let old_length = self.length;
+        let mut removed = 0;
+        for offset in 0..INPUT_QUEUE_LENGTH {
+            let retained = (offset + INPUT_QUEUE_LENGTH - old_tail) % INPUT_QUEUE_LENGTH;
+            if retained < old_length && self.inputs[offset].frame <= frame {
+                self.inputs[offset].frame = NULL_FRAME;
+                self.slots[offset] = VersionedInput {
+                    input: T::Input::default(),
+                    provenance: InputProvenance::Authoritative,
+                    revision: 0,
+                };
+                self.last_transitions[offset] = None;
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            return;
+        }
+        while self.length > 0 {
+            let offset = self.tail;
+            if self.inputs[offset].frame != NULL_FRAME {
+                break;
+            }
+            self.tail = (self.tail + 1) % INPUT_QUEUE_LENGTH;
+            self.length -= 1;
+        }
+        if self.length == 0 {
+            self.tail = self.head;
+        }
+    }
+
     /// Returns a `PlayerInput`, but only if the input for the requested frame is confirmed.
     /// In contrast to `input()`, this will not return a prediction if there is no confirmed input for the frame, but panic instead.
     pub(crate) fn confirmed_input(&self, requested_frame: Frame) -> PlayerInput<T::Input> {
@@ -108,6 +302,11 @@ impl<T: Config> InputQueue<T> {
 
     /// Discards confirmed frames up to given `frame` from the queue. All confirmed frames are guaranteed to be synchronized between players, so there is no need to save the inputs anymore.
     pub(crate) fn discard_confirmed_frames(&mut self, mut frame: Frame) {
+        if frame < 0 {
+            return;
+        }
+        let old_tail = self.tail;
+        let old_length = self.length;
         // we only drop frames until the last frame that was requested, otherwise we might delete data still needed
         if self.last_requested_frame != NULL_FRAME {
             frame = cmp::min(frame, self.last_requested_frame);
@@ -116,7 +315,7 @@ impl<T: Config> InputQueue<T> {
         // move the tail to "delete inputs", wrap around if necessary
         if frame >= self.last_added_frame {
             // delete all but most recent
-            self.tail = self.head;
+            self.tail = Self::prev_pos(self.head);
             self.length = 1;
         } else if frame <= self.inputs[self.tail].frame {
             // we don't need to delete anything
@@ -124,6 +323,19 @@ impl<T: Config> InputQueue<T> {
             let offset = (frame - (self.inputs[self.tail].frame)) as usize;
             self.tail = (self.tail + offset) % INPUT_QUEUE_LENGTH;
             self.length -= offset;
+        }
+        for index in 0..INPUT_QUEUE_LENGTH {
+            let was_retained = old_length > 0
+                && (index + INPUT_QUEUE_LENGTH - old_tail) % INPUT_QUEUE_LENGTH < old_length;
+            if was_retained && !self.retained_index(index) {
+                self.inputs[index].frame = NULL_FRAME;
+                self.slots[index] = VersionedInput {
+                    input: T::Input::default(),
+                    provenance: InputProvenance::Authoritative,
+                    revision: 0,
+                };
+                self.last_transitions[index] = None;
+            }
         }
     }
 
@@ -216,6 +428,12 @@ impl<T: Config> InputQueue<T> {
         // Add the frame to the back of the queue
         self.inputs[self.head] = input;
         self.inputs[self.head].frame = frame_number;
+        self.slots[self.head] = VersionedInput {
+            input: input.input,
+            provenance: InputProvenance::Authoritative,
+            revision: 0,
+        };
+        self.last_transitions[self.head] = None;
         self.head = (self.head + 1) % INPUT_QUEUE_LENGTH;
         self.length += 1;
         assert!(self.length <= INPUT_QUEUE_LENGTH);
@@ -290,7 +508,7 @@ mod input_queue_tests {
     use super::*;
 
     #[repr(C)]
-    #[derive(Copy, Clone, PartialEq, Default, Serialize, Deserialize)]
+    #[derive(Debug, Copy, Clone, PartialEq, Default, Serialize, Deserialize)]
     struct TestInput {
         inp: u8,
     }
@@ -519,5 +737,302 @@ mod input_queue_tests {
                 queue.discard_confirmed_frames(i - 1);
             }
         }
+    }
+
+    #[test]
+    fn exact_retry_uses_recorded_transition() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput::default())
+            .unwrap();
+        let predicted = queue.slot_state(0).unwrap();
+        assert_ne!(
+            predicted,
+            VersionedInput {
+                input: TestInput::default(),
+                provenance: InputProvenance::Authoritative,
+                revision: 0,
+            }
+        );
+
+        let authoritative = queue
+            .replace_past_slot(0, predicted, TestInput::default())
+            .unwrap();
+        assert_eq!(authoritative, InputReplacementResult::Replaced);
+        let replacement = queue.slot_state(0).unwrap();
+        assert_eq!(replacement.provenance, InputProvenance::Authoritative);
+        assert_eq!(replacement.revision, 1);
+        assert_eq!(queue.first_incorrect_frame(), NULL_FRAME);
+        let transition = queue.last_transitions[0];
+        assert_eq!(
+            queue.replace_past_slot(0, predicted, TestInput::default()),
+            Ok(InputReplacementResult::RetryNoOp)
+        );
+        assert_eq!(queue.slot_state(0), Some(replacement));
+        assert_eq!(queue.last_transitions[0], transition);
+        assert_eq!(queue.first_incorrect_frame(), NULL_FRAME);
+    }
+
+    #[test]
+    fn same_expected_with_different_replacement_is_conflict() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput { inp: 1 })
+            .unwrap();
+        let old = queue.slot_state(0).unwrap();
+        queue
+            .replace_past_slot(0, old, TestInput { inp: 2 })
+            .unwrap();
+        let before_slot = queue.slot_state(0);
+        let before_revision = before_slot.unwrap().revision;
+        let before_transition = queue.last_transitions[0];
+        let before_mismatch = queue.first_incorrect_frame();
+        assert_eq!(
+            queue.replace_past_slot(0, old, TestInput { inp: 3 }),
+            Err(InputReplacementError::Conflict)
+        );
+        assert_eq!(queue.slot_state(0), before_slot);
+        assert_eq!(queue.slot_state(0).unwrap().revision, before_revision);
+        assert_eq!(queue.last_transitions[0], before_transition);
+        assert_eq!(queue.first_incorrect_frame(), before_mismatch);
+    }
+
+    #[test]
+    fn current_state_is_not_a_historical_retry() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput { inp: 1 })
+            .unwrap();
+        let old = queue.slot_state(0).unwrap();
+        queue
+            .replace_past_slot(0, old, TestInput { inp: 2 })
+            .unwrap();
+        let current = queue.slot_state(0).unwrap();
+        assert_eq!(
+            queue.replace_past_slot(0, current, TestInput { inp: 2 }),
+            Err(InputReplacementError::Conflict)
+        );
+        assert_eq!(queue.slot_state(0), Some(current));
+    }
+
+    #[test]
+    fn same_target_with_different_expected_is_conflict() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput { inp: 1 })
+            .unwrap();
+        let old = queue.slot_state(0).unwrap();
+        queue
+            .replace_past_slot(0, old, TestInput { inp: 2 })
+            .unwrap();
+        let wrong_expected = VersionedInput {
+            input: TestInput { inp: 1 },
+            provenance: InputProvenance::Authoritative,
+            revision: old.revision,
+        };
+        assert_eq!(
+            queue.replace_past_slot(0, wrong_expected, TestInput { inp: 2 }),
+            Err(InputReplacementError::Conflict)
+        );
+    }
+
+    #[test]
+    fn authoritative_revision_marks_earliest_mismatch() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput { inp: 0 })
+            .unwrap();
+        let old0 = queue.slot_state(0).unwrap();
+        queue
+            .replace_past_slot(0, old0, TestInput { inp: 1 })
+            .unwrap();
+        queue
+            .materialize_predicted(1, TestInput { inp: 1 })
+            .unwrap();
+        let old1 = queue.slot_state(1).unwrap();
+        queue
+            .replace_past_slot(1, old1, TestInput { inp: 1 })
+            .unwrap();
+        assert_eq!(queue.first_incorrect_frame(), 0);
+        let current1 = queue.slot_state(1).unwrap();
+        queue
+            .replace_past_slot(1, current1, TestInput { inp: 2 })
+            .unwrap();
+        assert_eq!(queue.first_incorrect_frame(), 0);
+
+        let mut fresh = InputQueue::<TestConfig>::new();
+        fresh
+            .materialize_predicted(0, TestInput { inp: 1 })
+            .unwrap();
+        let old = fresh.slot_state(0).unwrap();
+        fresh
+            .replace_past_slot(0, old, TestInput { inp: 1 })
+            .unwrap();
+        fresh.reset_prediction();
+        let current = fresh.slot_state(0).unwrap();
+        fresh
+            .replace_past_slot(0, current, TestInput { inp: 2 })
+            .unwrap();
+        assert_eq!(fresh.first_incorrect_frame(), 0);
+    }
+
+    #[test]
+    fn trimming_full_queue_retains_newest_slot_and_drops_old_metadata() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        for frame in 0..INPUT_QUEUE_LENGTH as Frame {
+            queue
+                .materialize_predicted(frame, TestInput { inp: frame as u8 })
+                .unwrap();
+        }
+        queue.discard_confirmed_frames((INPUT_QUEUE_LENGTH - 1) as Frame);
+        assert!(queue
+            .slot_state((INPUT_QUEUE_LENGTH - 1) as Frame)
+            .is_some());
+        assert!(queue.slot_state(0).is_none());
+        assert_eq!(queue.length, 1);
+        assert_eq!(queue.tail, InputQueue::<TestConfig>::prev_pos(queue.head));
+    }
+
+    #[test]
+    fn external_trim_removes_logical_slots_and_transitions() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        for frame in 0..3 {
+            queue
+                .materialize_predicted(frame, TestInput { inp: frame as u8 })
+                .unwrap();
+        }
+        let old = queue.slot_state(0).unwrap();
+        queue
+            .replace_past_slot(0, old, TestInput { inp: 9 })
+            .unwrap();
+        queue.trim_external_through(1);
+        assert!(queue.slot_state(0).is_none());
+        assert!(queue.slot_state(1).is_none());
+        assert!(queue.slot_state(2).is_some());
+        assert_eq!(queue.length, 1);
+        assert_eq!(queue.last_transitions[0], None);
+        assert_eq!(queue.last_transitions[1], None);
+        assert_eq!(
+            queue.replace_past_slot(0, old, TestInput { inp: 4 }),
+            Err(InputReplacementError::OutOfRetention)
+        );
+    }
+
+    #[test]
+    fn full_queue_retained_slot_replaces_in_place() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        for frame in 0..INPUT_QUEUE_LENGTH as Frame {
+            queue
+                .materialize_predicted(frame, TestInput { inp: frame as u8 })
+                .unwrap();
+        }
+        let old = queue.slot_state(127).unwrap();
+        let before = (queue.head, queue.tail, queue.length);
+        assert_eq!(
+            queue.replace_past_slot(127, old, TestInput { inp: 9 }),
+            Ok(InputReplacementResult::Replaced)
+        );
+        assert_eq!((queue.head, queue.tail, queue.length), before);
+    }
+
+    #[test]
+    fn invalid_frames_are_atomic() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        let before_inputs = queue.inputs.clone();
+        let before_slots = queue.slots.clone();
+        let before_transitions = queue.last_transitions.clone();
+        let before = (
+            queue.head,
+            queue.tail,
+            queue.length,
+            queue.first_incorrect_frame,
+        );
+        assert_eq!(queue.slot_state(NULL_FRAME), None);
+        assert_eq!(queue.slot_state(-2), None);
+        assert_eq!(
+            queue.materialize_predicted(NULL_FRAME, TestInput::default()),
+            Err(InputReplacementError::InvalidFrame)
+        );
+        assert_eq!(
+            queue.materialize_predicted(-2, TestInput::default()),
+            Err(InputReplacementError::InvalidFrame)
+        );
+        let expected = VersionedInput {
+            input: TestInput::default(),
+            provenance: InputProvenance::Predicted,
+            revision: 0,
+        };
+        assert_eq!(
+            queue.replace_past_slot(NULL_FRAME, expected, TestInput::default()),
+            Err(InputReplacementError::InvalidFrame)
+        );
+        assert_eq!(
+            queue.replace_past_slot(-2, expected, TestInput::default()),
+            Err(InputReplacementError::InvalidFrame)
+        );
+        assert_eq!(
+            (
+                queue.head,
+                queue.tail,
+                queue.length,
+                queue.first_incorrect_frame
+            ),
+            before
+        );
+        assert_eq!(queue.inputs, before_inputs);
+        assert_eq!(queue.slots, before_slots);
+        assert_eq!(queue.last_transitions, before_transitions);
+    }
+
+    #[test]
+    fn revision_overflow_is_atomic() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput { inp: 1 })
+            .unwrap();
+        queue.slots[0].revision = u64::MAX;
+        let expected = queue.slot_state(0).unwrap();
+        let before_inputs = queue.inputs.clone();
+        let before_slots = queue.slots.clone();
+        let before_transitions = queue.last_transitions.clone();
+        let before = (
+            queue.head,
+            queue.tail,
+            queue.length,
+            queue.first_incorrect_frame,
+        );
+        assert_eq!(
+            queue.replace_past_slot(0, expected, TestInput { inp: 2 }),
+            Err(InputReplacementError::RevisionOverflow)
+        );
+        assert_eq!(queue.inputs, before_inputs);
+        assert_eq!(queue.slots, before_slots);
+        assert_eq!(queue.last_transitions, before_transitions);
+        assert_eq!(
+            (
+                queue.head,
+                queue.tail,
+                queue.length,
+                queue.first_incorrect_frame
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn predicted_and_authoritative_default_are_distinct() {
+        let mut queue = InputQueue::<TestConfig>::new();
+        queue
+            .materialize_predicted(0, TestInput::default())
+            .unwrap();
+        let predicted = queue.slot_state(0).unwrap();
+        queue
+            .replace_past_slot(0, predicted, TestInput::default())
+            .unwrap();
+        let authoritative = queue.slot_state(0).unwrap();
+        assert_eq!(predicted.input, authoritative.input);
+        assert_ne!(predicted.provenance, authoritative.provenance);
+        assert_eq!(predicted.revision + 1, authoritative.revision);
+        assert_eq!(queue.first_incorrect_frame(), NULL_FRAME);
     }
 }
