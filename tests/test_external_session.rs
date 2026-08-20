@@ -1,5 +1,7 @@
 use ggrs::{
-    Config, ExternalSession, GgrsError, GgrsRequest, InputStatus, PredictRepeatLast, SessionBuilder,
+    Config, ExternalInputProvenance, ExternalInputReplacement, ExternalInputReplacementError,
+    ExternalInputStateError, ExternalSession, GgrsError, GgrsRequest, InputStatus,
+    PredictRepeatLast, SessionBuilder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -285,4 +287,94 @@ fn external_history_is_independent_from_prediction_window() {
         .start_external_session();
 
     assert_eq!(session.rollback_history_frames(), 11);
+}
+
+#[test]
+fn public_input_lookup_exposes_value_and_provenance() {
+    let mut session = single_player_session();
+    fulfill_requests(&mut session, &[None]);
+    let state = session.input_state(0, 0).unwrap();
+
+    assert_eq!(state.input(), TestInput::default());
+    assert_eq!(state.provenance(), ExternalInputProvenance::Predicted);
+}
+
+#[test]
+fn public_replacement_returns_state_and_exact_retry_is_no_op() {
+    let mut session = single_player_session();
+    fulfill_requests(&mut session, &[None]);
+    let expected = session.input_state(0, 0).unwrap();
+    let replacement = TestInput { value: 9 };
+
+    let result = session
+        .replace_past_input(0, 0, expected, replacement)
+        .unwrap();
+    let resulting = match result {
+        ExternalInputReplacement::Replaced(state) => state,
+        ExternalInputReplacement::RetryNoOp(_) => panic!("first replacement unexpectedly retried"),
+    };
+    assert_eq!(resulting.input(), replacement);
+    assert_eq!(
+        resulting.provenance(),
+        ExternalInputProvenance::Authoritative
+    );
+
+    assert!(matches!(
+        session.replace_past_input(0, 0, expected, replacement),
+        Ok(ExternalInputReplacement::RetryNoOp(state))
+            if state == resulting
+    ));
+}
+
+#[test]
+fn public_replacement_maps_errors_and_does_not_mutate_on_mismatch() {
+    let mut session = single_player_session();
+    fulfill_requests(&mut session, &[None]);
+    let expected = session.input_state(0, 0).unwrap();
+    fulfill_requests(&mut session, &[Some(TestInput { value: 8 })]);
+    let wrong_expected = session.input_state(0, 1).unwrap();
+
+    assert_eq!(
+        session.input_state(1, 0),
+        Err(ExternalInputStateError::InvalidHandle)
+    );
+    assert_eq!(
+        session.input_state(0, -1),
+        Err(ExternalInputStateError::InvalidFrame)
+    );
+    assert_eq!(
+        session.input_state(0, 2),
+        Err(ExternalInputStateError::Unavailable)
+    );
+    assert_eq!(
+        session.replace_past_input(1, 0, expected, TestInput { value: 1 }),
+        Err(ExternalInputReplacementError::InvalidHandle)
+    );
+    assert_eq!(
+        session.replace_past_input(0, -1, expected, TestInput { value: 1 }),
+        Err(ExternalInputReplacementError::InvalidFrame)
+    );
+
+    let replacement = TestInput { value: 3 };
+    session
+        .replace_past_input(0, 0, expected, replacement)
+        .unwrap();
+    assert_eq!(
+        session.replace_past_input(0, 0, wrong_expected, TestInput { value: 4 }),
+        Err(ExternalInputReplacementError::ExpectedStateMismatch)
+    );
+    assert_eq!(session.input_state(0, 0).unwrap().input(), replacement);
+}
+
+#[test]
+fn missing_mandatory_save_state_maps_to_snapshot_unavailable() {
+    let mut session = single_player_session();
+    // This setup represents an unfulfilled mandatory SaveGameState request.
+    session.advance_frame(&[None]).unwrap();
+    let expected = session.input_state(0, 0).unwrap();
+
+    assert_eq!(
+        session.replace_past_input(0, 0, expected, TestInput { value: 2 }),
+        Err(ExternalInputReplacementError::SnapshotUnavailable)
+    );
 }

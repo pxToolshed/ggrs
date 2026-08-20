@@ -276,6 +276,17 @@ impl<T: Config> SyncLayer<T> {
             .collect()
     }
 
+    pub(crate) fn input_state(
+        &self,
+        player_handle: PlayerHandle,
+        frame: Frame,
+    ) -> Option<VersionedInput<T::Input>> {
+        if player_handle >= self.num_players as PlayerHandle || frame < 0 {
+            return None;
+        }
+        self.input_queues[player_handle as usize].slot_state(frame)
+    }
+
     pub(crate) fn replace_past_input(
         &mut self,
         player_handle: PlayerHandle,

@@ -118,7 +118,10 @@ pub use network::network_stats::NetworkStats;
 pub use network::udp_socket::UdpNonBlockingSocket;
 use serde::{de::DeserializeOwned, Serialize};
 pub use sessions::builder::SessionBuilder;
-pub use sessions::external_session::ExternalSession;
+pub use sessions::external_session::{
+    ExternalInputProvenance, ExternalInputReplacement, ExternalInputReplacementError,
+    ExternalInputState, ExternalInputStateError, ExternalSession,
+};
 pub use sessions::p2p_session::P2PSession;
 pub use sessions::p2p_spectator_session::SpectatorSession;
 pub use sessions::sync_test_session::SyncTestSession;
